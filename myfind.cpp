@@ -6,12 +6,25 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <cstring>
+
+// für msg queue
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
 using namespace std;
 namespace fs = std::filesystem;
 
+/**
+mtype: Nachrichtentyp um evtl. nachher zu Filter (bei uns irrelevant)
+mtext: der eigentliche Text = PATH_MAX (maximale Pfadlänge im System) */
+struct msgqueue {
+    long mtype;
+    char mtext[PATH_MAX];
+};
+
 string lowerCase(const string &s) {
     string out = s;
-    for(int i=0; i < out.size(); i++) {
+    for(size_t i=0; i < out.size(); i++) {
         // zu unsigned char casten = positiver Wert, weil signed char oft negativ
         // weil an tolower() muss ein positiver Wert übergeben wird
         out[i] = tolower(static_cast<unsigned char>(out[i]));
@@ -19,7 +32,7 @@ string lowerCase(const string &s) {
     return out;
 }
 
-bool search(const string &sp, const string &filename, bool recursive, bool casesensitive) {
+bool search(const string &sp, const string &filename, bool recursive, bool casesensitive, int msqid) {
     // umwandeln in const char*, weil viele Fkt. es so erwarten
     const char* searchpath = sp.c_str();
     // Öffnet das Verzeichnis; bei Fehler nullptr
@@ -65,17 +78,20 @@ bool search(const string &sp, const string &filename, bool recursive, bool cases
                 // nullptr --> Datei existiert nicht oder keine Berechtigung
                 if(realpath(path.c_str(), absolutePath) != nullptr) {
                     fileFound = true;
-                    // ohne cout, weil mehrere Kindprozesse gleichzeitig schreiben könnten und irgendein Blödsinn raus kommt; lieber write() verwenden weil es ohne Puffer arbeitet
                     string line = to_string(getpid()) + ": " + filename + ": " + absolutePath + "\n";
-                    // Standardausgabe mit STDOUT_FILENO
-                    write(STDOUT_FILENO, line.c_str(), line.size());
+                    // Msg-Queue
+                    struct msgqueue msg;
+                    msg.mtype = 1;
+                    strncpy(msg.mtext, line.c_str(), sizeof(msg.mtext)-1);
+                    msg.mtext[sizeof(msg.mtext)-1] = '\0';
+                    msgsnd(msqid, &msg, strlen(msg.mtext)+1, 0);
                 }
             }
         // wenn es keine Datei ist (und somit ein Directory)
         // wird nur aufgerufen, wenn recursiv, sonst würde er ja die Ordner nicht durchgehen
         }else if(recursive && S_ISDIR(fileStat.st_mode)) {
             // ruft recursiv nochmals die Methode auf, diesmal ist aber in path nun der Unterordner eingetragen
-            if(search(path, filename, recursive, casesensitive)) {
+            if(search(path, filename, recursive, casesensitive, msqid)) {
                 fileFound = true;
             }
         }
@@ -131,6 +147,19 @@ int main(int argc, char* argv[]) {
         files.push_back(argv[i]);
     }
 
+    // Message Queue anlegen
+    /**
+    msgget: erzeugt oder öffnet eine Message Queue
+    IPC_PRIVATE: Queue nur für diesen Prozess und seine Kinder gedacht ist (nicht für andere Programme)
+    IPC_CREAT: sagt, dass eine neue Queue erstellt werden soll, falls sie nicht existiert
+    0600: Rechte (rw-------), nur der Besitzer darf lesen und schreiben
+    msqid: eine ID, über die wir die Queue ansprechen. */
+    int msqid = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
+    if(msqid == -1) {
+        cerr << "Fehler beim Erstellen der Message Queue: " << strerror(errno) << endl;
+        return 1;
+    }
+
     // Vector mit allen Kindern
     vector<pid_t> child_pids;
     // For schleife über alle Files (für jedes FIle soll ein Kindprozess gestartet werden)
@@ -143,12 +172,15 @@ int main(int argc, char* argv[]) {
             break;
         // bei pid == 0 -> Child-Prozess: führt Suche durch und beendet sich danach
         } else if (pid == 0) {
-            bool fileFound = search(searchpath, file, recursive, casesensitive);
+            bool fileFound = search(searchpath, file, recursive, casesensitive, msqid);
             if(!fileFound) {
                 // Error Ausgabe
                 string errline = to_string(getpid()) + ": " + file + ": not found\n";
-                write(STDERR_FILENO, errline.c_str(), errline.size());
-                // Child beendet mit Fehlercode
+                struct msgqueue msg;
+                msg.mtype = 1;
+                strncpy(msg.mtext, errline.c_str(), sizeof(msg.mtext)-1);
+                msg.mtext[sizeof(msg.mtext)-1] = '\0';
+                msgsnd(msqid, &msg, strlen(msg.mtext)+1, 0);                // Child beendet mit Fehlercode
                 _exit(1);
             } else {
                 // Child beendet erfolgreich
@@ -185,6 +217,25 @@ int main(int argc, char* argv[]) {
             anyChildFailed = true;
         }
     }
+
+    // Nachrichten auslesen
+    /**
+    msqid: unsere Queue
+    &msg: Adresse der Nachricht
+    sizeof(msg.mtext): maximale Länge der Nachricht, die wir empfangen wollen
+    0: wir akzeptieren Nachrichten jeden Typs
+    IPC_NOWAIT: wenn keine Nachricht mehr da ist -> abbrechen, nicht blockieren
+    while(... > 0): solange lesen, bis keine Nachricht mehr da ist */
+    struct msgqueue msg;
+    while(msgrcv(msqid, &msg, sizeof(msg.mtext), 0, IPC_NOWAIT) > 0) {
+        cout << msg.mtext;
+    }
+    // Queue löschen
+    /**
+    msgctl: Verwaltung für Message Queues
+    IPC_RMID: löscht die Queue komplett, sobald kein Prozess mehr darauf zugreift
+    sonst müllt die Queue den Speicher zu */
+    msgctl(msqid, IPC_RMID, nullptr);
 
     if(anyChildFailed) {
         return 1;
