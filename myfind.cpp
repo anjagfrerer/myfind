@@ -6,22 +6,35 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <cstring>
-
 // für msg queue
 #include <sys/ipc.h>
 #include <sys/msg.h>
+#include <cstdlib> // für EXIT_FAILURE
 
 using namespace std;
 namespace fs = std::filesystem;
 
 /**
-mtype: Nachrichtentyp um evtl. nachher zu Filter (bei uns irrelevant)
-mtext: der eigentliche Text = PATH_MAX (maximale Pfadlänge im System) */
+* Message Queue für eine synchronisierte Ausgabe mit den Childs
+* mtype: Nachrichtentyp um evtl. nachher zu Filter (bei uns irrelevant)
+* mtext: der eigentliche Text = PATH_MAX (maximale Pfadlänge im System)
+*/
 struct msgqueue {
     long mtype;
     char mtext[PATH_MAX];
 };
 
+/**
+ * @brief Wandelt einen String in Kleinbuchstaben um.
+ *
+ * Geht durch alle Zeichen des übergebenen Strings und
+ * gibt eine Kopie zurück, in der jedes Zeichen in seinen Kleinbuchstaben
+ * umgewandelt wurde.
+ * Damit das auch bei Sonderzeichen klappt, wird vorher auf unsigned char gecastet.
+ *
+ * @param s Eingabestring (Filename)
+ * @return Zeichenkette, die dem Eingabestring in Kleinbuchstaben darstellt.
+ */
 string lowerCase(const string &s) {
     string out = s;
     for(size_t i=0; i < out.size(); i++) {
@@ -32,6 +45,21 @@ string lowerCase(const string &s) {
     return out;
 }
 
+/**
+ * @brief Sucht in einem Verzeichnis nach einem File und schickt Treffer an eine Message-Queue.
+ *
+ * Diese Funktion geht alle Dateien im angegebenen Verzeichnis durch und
+ * prüft, ob der File-name mit dem Gesuchten übereinstimmt.  
+ * Wenn recursive true ist, werden auch Unterverzeichnisse durchsucht.  
+ * Gefundene Files werden in die Message-Queue eingetragen.
+ *
+ * @param sp Startpfad, in dem gesucht wird.
+ * @param filename Name des Files, das gesucht wird.
+ * @param recursive Wenn true, werden auch Unterverzeichnisse durchsucht.
+ * @param casesensitive Wenn true, wird auf Groß-/Kleinschreibung geachtet.
+ * @param msqid ID der Message-Queue, in die gefundene Pfade geschrieben werden.
+ * @return true, wenn mindestens eine Datei gefunden wurde, sonst false.
+ */
 bool search(const string &sp, const string &filename, bool recursive, bool casesensitive, int msqid) {
     // umwandeln in const char*, weil viele Fkt. es so erwarten
     const char* searchpath = sp.c_str();
@@ -102,6 +130,21 @@ bool search(const string &sp, const string &filename, bool recursive, bool cases
     return fileFound;
 }
 
+/**
+ * @brief Main für die Dateisuche.
+ *
+ * Liest die args ein und startet für jede gesuchte Datei
+ * einen Child-Prozess. Diese führen die Suche durch und geben die Ergebnisse
+ * über eine Message-Queue aus.
+ * - -R für rekursive Suche in Unterverzeichnissen
+ * - -i für case-insensitive Suche
+ *
+ * @param argc Anzahl der args.
+ * @param argv Array mit den args. Erwartet:
+ *             argv[0]   = Programmname
+ *             argv[1..] = Optionen (-R, -i) und dann: searchpath filename1 [filename2...]
+ * @return 0, wenn alles erfolgreich war, 1 bei Fehlern
+ */
 int main(int argc, char* argv[]) {
     bool recursive = false;
     bool casesensitive = true;
@@ -120,7 +163,7 @@ int main(int argc, char* argv[]) {
                 break;
             default:
                 cerr << "Unbekannte Option: " << char(optopt) << endl;
-                return 1;
+                return EXIT_FAILURE;
         }
     }
 
@@ -128,7 +171,7 @@ int main(int argc, char* argv[]) {
     // checkt ob optind >= argc --> wenn ja, wurden kein Pfad und Filename eingegeben
     if (optind >= argc) {
         cerr << "Usage: " << argv[0] << " [-R] [-i] searchpath filename1 [filename2 ...]" << endl;
-        return 1;
+        return EXIT_FAILURE;
     }
 
     // erste nicht Option ist dann der Pfad
@@ -138,7 +181,7 @@ int main(int argc, char* argv[]) {
     // checken, ob der vom User angegebene Pfad überhaupt existiert und ob es eh ein Pfad ist
     if(!fs::exists(p) || !fs::is_directory(p)) {
         cerr << "Kein gültiger Pfad: " << searchpath << endl;
-        return 1;
+        return EXIT_FAILURE;
     }
 
     // Alle filenames, die der User eingegeben hat, in einem vector speichern
@@ -157,7 +200,7 @@ int main(int argc, char* argv[]) {
     int msqid = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
     if(msqid == -1) {
         cerr << "Fehler beim Erstellen der Message Queue: " << strerror(errno) << endl;
-        return 1;
+        return EXIT_FAILURE;
     }
 
     // Vector mit allen Kindern
@@ -181,7 +224,7 @@ int main(int argc, char* argv[]) {
                 strncpy(msg.mtext, errline.c_str(), sizeof(msg.mtext)-1);
                 msg.mtext[sizeof(msg.mtext)-1] = '\0';
                 msgsnd(msqid, &msg, strlen(msg.mtext)+1, 0);                // Child beendet mit Fehlercode
-                _exit(1);
+                _exit(EXIT_FAILURE);
             } else {
                 // Child beendet erfolgreich
                 _exit(0);
@@ -238,7 +281,7 @@ int main(int argc, char* argv[]) {
     msgctl(msqid, IPC_RMID, nullptr);
 
     if(anyChildFailed) {
-        return 1;
+        return EXIT_FAILURE;
     }
 
     return 0;
